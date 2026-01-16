@@ -22,8 +22,8 @@ A robust and scalable system for detecting moving objects (asteroids, comets com
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/asteroid-detection-platform.git
-cd asteroid-detection-platform
+git clone https://github.com/Techmetis-LLC/BSA_SkySurvey
+cd BCA_SkySurvey
 
 # Run setup script
 chmod +x scripts/setup.sh
