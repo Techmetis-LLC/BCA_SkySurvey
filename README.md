@@ -4,11 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GCP](https://img.shields.io/badge/GCP-Ready-green.svg)](https://cloud.google.com/)
 
-A professional-grade system for detecting moving objects (asteroids, comets) in astronomical image sequences. Identify potential new discoveries or match with known objects in NASA/Minor Planet Center databases.
-
-<p align="center">
-  <img src="docs/images/demo.png" alt="Asteroid Detection Demo" width="800">
-</p>
+A robust and scalable system for detecting moving objects (asteroids, comets coming soon) in astronomical image sequences. Identify potential new discoveries or match with known objects in NASA/Minor Planet Center databases.
 
 ## Features
 
