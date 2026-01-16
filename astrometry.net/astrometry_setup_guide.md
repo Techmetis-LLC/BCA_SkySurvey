@@ -489,9 +489,9 @@ solve-field image.fits \
 5. **Run the detector** with plate-solved images
 
 Once your images have proper WCS, the detection system will automatically:
-- ✅ Extract sky coordinates for all detections
-- ✅ Query SkyBoT for object identification
-- ✅ Generate reports with RA/Dec coordinates
-- ✅ Identify known asteroids and comets
+- Extract sky coordinates for all detections
+- Query SkyBoT for object identification
+- Generate reports with RA/Dec coordinates
+- Identify known asteroids and comets
 
 Need help with any of these steps? Let me know!
