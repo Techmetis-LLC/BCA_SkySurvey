@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-Astronomical Object Detection System
-=====================================
-Detects moving objects (asteroids, comets) in astronomical image sequences
-by identifying objects that don't follow stellar motion patterns.
-
-Author: Dennis
-License: MIT
-"""
 
 import argparse
 import logging
