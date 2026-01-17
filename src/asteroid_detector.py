@@ -50,8 +50,9 @@ logger = logging.getLogger(__name__)
 class ImageProcessor:
     """Handles loading and preprocessing of astronomical images."""
     
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, max_dimension: Optional[int] = None):
         self.debug = debug
+        self.max_dimension = max_dimension  # Maximum image dimension for downsampling
         self.supported_formats = ['.jpg', '.jpeg', '.tiff', '.tif', '.fits', '.fit', '.xisf']
     
     def load_image(self, filepath: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -66,14 +67,61 @@ class ImageProcessor:
         
         try:
             if suffix in ['.fits', '.fit']:
-                return self._load_fits(filepath, metadata)
+                data, metadata = self._load_fits(filepath, metadata)
             elif suffix == '.xisf':
-                return self._load_xisf(filepath, metadata)
+                data, metadata = self._load_xisf(filepath, metadata)
             else:
-                return self._load_standard_image(filepath, metadata)
+                data, metadata = self._load_standard_image(filepath, metadata)
+            
+            # Downsample if image is too large
+            if self.max_dimension and max(data.shape) > self.max_dimension:
+                data, metadata = self._downsample_image(data, metadata)
+            
+            return data, metadata
+            
         except Exception as e:
             logger.error(f"Failed to load {filepath}: {e}")
             raise
+    
+    def _downsample_image(self, data: np.ndarray, metadata: Dict) -> Tuple[np.ndarray, Dict]:
+        """Downsample large images to save memory."""
+        original_shape = data.shape
+        
+        # Calculate downsampling factor
+        max_dim = max(data.shape)
+        scale_factor = self.max_dimension / max_dim
+        
+        new_height = int(data.shape[0] * scale_factor)
+        new_width = int(data.shape[1] * scale_factor)
+        
+        logger.info(f"Downsampling image from {original_shape} to ({new_height}, {new_width}) "
+                   f"to reduce memory usage (scale={scale_factor:.2f})")
+        
+        # Use cv2 for fast downsampling
+        downsampled = cv2.resize(data.astype(np.float32), 
+                                (new_width, new_height), 
+                                interpolation=cv2.INTER_AREA)
+        
+        metadata['downsampled'] = True
+        metadata['original_shape'] = original_shape
+        metadata['scale_factor'] = scale_factor
+        
+        # Update WCS if present
+        if 'wcs' in metadata and metadata['wcs'] is not None:
+            # Scale the WCS reference pixel
+            try:
+                wcs = metadata['wcs']
+                wcs.wcs.crpix[0] *= scale_factor
+                wcs.wcs.crpix[1] *= scale_factor
+                # Note: CD matrix should also be scaled but this is approximate
+                if hasattr(wcs.wcs, 'cd') and wcs.wcs.cd is not None:
+                    wcs.wcs.cd /= scale_factor
+                metadata['wcs'] = wcs
+            except Exception as e:
+                logger.warning(f"Could not scale WCS: {e}")
+                metadata['wcs'] = None
+        
+        return downsampled.astype(np.float64), metadata
     
     def _load_fits(self, filepath: Path, metadata: Dict) -> Tuple[np.ndarray, Dict]:
         """Load FITS image."""
@@ -103,15 +151,174 @@ class ImageProcessor:
         return data, metadata
     
     def _load_xisf(self, filepath: Path, metadata: Dict) -> Tuple[np.ndarray, Dict]:
-        """Load XISF image (requires xisf library)."""
+        """Load XISF image (PixInsight format)."""
         try:
             import xisf
-            xisf_file = xisf.XISF(filepath)
-            data = xisf_file.read_image(0).astype(np.float64)
-            metadata['xisf_metadata'] = xisf_file.get_metadata()
+            
+            # Open XISF file
+            xisf_file = xisf.XISF(str(filepath))
+            
+            # Read image data
+            # The file_meta contains information about images in the file
+            if hasattr(xisf_file, 'read_image'):
+                data = xisf_file.read_image(0)
+            elif hasattr(xisf_file, 'get_images_data'):
+                images_data = xisf_file.get_images_data()
+                if images_data and len(images_data) > 0:
+                    data = images_data[0]
+                else:
+                    raise ValueError("No image data found in XISF file")
+            else:
+                raise ValueError("Unsupported xisf library version")
+            
+            # Handle different array dimensions
+            original_shape = data.shape
+            
+            if self.debug:
+                logger.debug(f"XISF raw data shape: {original_shape}, dtype: {data.dtype}")
+            
+            # Convert multi-dimensional arrays to 2D
+            if len(data.shape) == 3:
+                # Could be (height, width, channels) or (channels, height, width)
+                if data.shape[2] <= 4:
+                    # Likely (height, width, channels) - RGB or RGBA
+                    logger.info(f"Converting {data.shape[2]}-channel XISF to grayscale")
+                    if data.shape[2] == 1:
+                        # Single channel - just squeeze
+                        data = data[:, :, 0]
+                    else:
+                        # Multi-channel - average or take first channel
+                        # For astronomical images, channels might be RGB or narrowband
+                        # Taking the mean is usually safe
+                        data = np.mean(data, axis=2)
+                elif data.shape[0] <= 4:
+                    # Likely (channels, height, width)
+                    logger.info(f"Converting {data.shape[0]}-channel XISF to grayscale")
+                    if data.shape[0] == 1:
+                        data = data[0, :, :]
+                    else:
+                        data = np.mean(data, axis=0)
+                else:
+                    # Ambiguous - try to figure out which is the channel dimension
+                    # Usually the smallest dimension is channels
+                    min_dim = data.shape.index(min(data.shape))
+                    logger.info(f"Converting multi-dimensional XISF (shape={data.shape}) to grayscale")
+                    if min_dim == 0:
+                        data = np.mean(data, axis=0)
+                    elif min_dim == 2:
+                        data = np.mean(data, axis=2)
+                    else:
+                        # Middle dimension is smallest - unusual but handle it
+                        data = np.mean(data, axis=1)
+            
+            elif len(data.shape) == 4:
+                # Very unusual - might be (batch, channels, height, width) or similar
+                logger.warning(f"XISF has 4D data (shape={data.shape}), attempting to reduce to 2D")
+                # Take first batch and average channels
+                if data.shape[0] == 1:
+                    data = data[0]  # Remove batch dimension
+                else:
+                    data = data[0]  # Take first batch
+                
+                # Now handle as 3D
+                if len(data.shape) == 3:
+                    if data.shape[0] <= 4:
+                        data = np.mean(data, axis=0)
+                    elif data.shape[2] <= 4:
+                        data = np.mean(data, axis=2)
+            
+            elif len(data.shape) > 4:
+                raise ValueError(f"XISF data has too many dimensions: {data.shape}")
+            
+            # Ensure we have a 2D array
+            if len(data.shape) != 2:
+                raise ValueError(f"Could not convert XISF to 2D array. Final shape: {data.shape}")
+            
+            # Convert to float64
+            data = data.astype(np.float64)
+            
+            if self.debug:
+                logger.debug(f"XISF converted: {original_shape} -> {data.shape}, dtype={data.dtype}")
+                logger.debug(f"Data range: min={data.min():.2f}, max={data.max():.2f}, mean={data.mean():.2f}")
+            
+            # Try to extract metadata
+            try:
+                # Different xisf versions have different metadata access
+                if hasattr(xisf_file, 'get_file_metadata'):
+                    file_meta = xisf_file.get_file_metadata()
+                    metadata['xisf_file_metadata'] = file_meta
+                
+                if hasattr(xisf_file, 'get_images_metadata'):
+                    images_meta = xisf_file.get_images_metadata()
+                    if images_meta and len(images_meta) > 0:
+                        metadata['xisf_image_metadata'] = images_meta[0]
+                
+                # Try to extract FITS-like keywords from XISF metadata
+                if 'xisf_image_metadata' in metadata:
+                    img_meta = metadata['xisf_image_metadata']
+                    
+                    # Look for observation time in various formats
+                    for time_key in ['DATE-OBS', 'DATE', 'FRAME']:
+                        if isinstance(img_meta, dict) and time_key in img_meta:
+                            try:
+                                metadata['obs_time'] = Time(img_meta[time_key])
+                                break
+                            except:
+                                continue
+                    
+                    # Look for WCS information
+                    # XISF can store WCS in FITSKeywords
+                    if isinstance(img_meta, dict) and 'FITSKeywords' in img_meta:
+                        fits_keywords = img_meta['FITSKeywords']
+                        
+                        # Try to construct WCS from FITS keywords
+                        try:
+                            # Create a simple header-like dict
+                            header_dict = {}
+                            
+                            if isinstance(fits_keywords, dict):
+                                for key, value in fits_keywords.items():
+                                    header_dict[key] = value
+                            elif isinstance(fits_keywords, list):
+                                # Sometimes it's a list of (key, value, comment) tuples
+                                for item in fits_keywords:
+                                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                        header_dict[item[0]] = item[1]
+                            
+                            # Try to create WCS from the header dict
+                            if header_dict:
+                                from astropy.io.fits import Header
+                                fits_header = Header()
+                                for key, value in header_dict.items():
+                                    try:
+                                        fits_header[key] = value
+                                    except:
+                                        pass
+                                
+                                try:
+                                    wcs = WCS(fits_header)
+                                    metadata['wcs'] = wcs
+                                except:
+                                    logger.debug("Could not create WCS from XISF FITS keywords")
+                        except Exception as e:
+                            logger.debug(f"Error parsing XISF WCS: {e}")
+                
+            except Exception as e:
+                logger.debug(f"Could not extract XISF metadata: {e}")
+                metadata['xisf_metadata'] = "Metadata extraction not supported by this xisf version"
+            
+            logger.info(f"Loaded XISF image: {original_shape} -> {data.shape}")
+            
             return data, metadata
+            
         except ImportError:
-            raise ImportError("xisf library required for XISF support. Install with: pip install xisf")
+            raise ImportError(
+                "xisf library required for XISF support. Install with: pip install xisf\n"
+                "For older systems, try: pip install 'xisf>=0.1.0,<1.0.0'"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load XISF file: {e}")
+            raise
     
     def _load_standard_image(self, filepath: Path, metadata: Dict) -> Tuple[np.ndarray, Dict]:
         """Load standard image formats (JPG, TIFF)."""
@@ -128,6 +335,11 @@ class ImageProcessor:
         # Basic preprocessing
         processed = data.copy()
         
+        # Check memory usage and potentially downsample large images
+        image_size_mb = processed.nbytes / (1024 * 1024)
+        if image_size_mb > 500:  # If image is larger than 500MB
+            logger.warning(f"Large image detected ({image_size_mb:.1f} MB). Consider using smaller images or binning.")
+        
         # Remove hot pixels and cosmic rays
         processed = self._remove_cosmic_rays(processed)
         
@@ -136,7 +348,8 @@ class ImageProcessor:
         
         if self.debug:
             logger.debug(f"Image preprocessed: shape={processed.shape}, "
-                        f"min={processed.min():.2f}, max={processed.max():.2f}")
+                        f"min={processed.min():.2f}, max={processed.max():.2f}, "
+                        f"memory={processed.nbytes/(1024*1024):.1f}MB")
         
         return processed
     
@@ -461,9 +674,16 @@ class PlateSolver:
         """Solve the astrometric solution for an image."""
         # If WCS already exists in metadata, use it
         if 'wcs' in metadata and metadata['wcs'] is not None:
-            if self.debug:
-                logger.debug("Using existing WCS solution")
-            return metadata['wcs']
+            wcs = metadata['wcs']
+            
+            # Validate the WCS
+            if self._validate_wcs(wcs):
+                if self.debug:
+                    logger.debug("Using existing WCS solution")
+                return wcs
+            else:
+                logger.warning("WCS validation failed - WCS may be invalid or incomplete")
+                return None
         
         # Try to use astrometry.net for plate solving
         try:
@@ -471,6 +691,54 @@ class PlateSolver:
         except Exception as e:
             logger.warning(f"Plate solving failed: {e}")
             return None
+    
+    def _validate_wcs(self, wcs: WCS) -> bool:
+        """Validate that WCS has proper celestial coordinates."""
+        try:
+            # Check if WCS has celestial coordinates
+            if not wcs.has_celestial:
+                logger.warning("WCS does not have celestial coordinates")
+                return False
+            
+            # Check coordinate types
+            ctype = wcs.wcs.ctype
+            if len(ctype) < 2:
+                logger.warning("WCS missing coordinate types")
+                return False
+            
+            # Check for RA/Dec coordinate system
+            is_celestial = (
+                ('RA' in ctype[0] or 'GLON' in ctype[0]) and
+                ('DEC' in ctype[1] or 'GLAT' in ctype[1])
+            )
+            
+            if not is_celestial:
+                logger.warning(f"WCS coordinate types not recognized as celestial: {ctype}")
+                return False
+            
+            # Try a test conversion at image center
+            test_x, test_y = 512, 512  # Typical center
+            try:
+                world = wcs.wcs_pix2world([[test_x, test_y]], 0)
+                ra, dec = float(world[0][0]), float(world[0][1])
+                
+                # Check if coordinates are reasonable
+                if not (0 <= ra <= 360):
+                    logger.warning(f"WCS test conversion gave invalid RA: {ra}")
+                    return False
+                if not (-90 <= dec <= 90):
+                    logger.warning(f"WCS test conversion gave invalid Dec: {dec}")
+                    return False
+                    
+            except Exception as e:
+                logger.warning(f"WCS test conversion failed: {e}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"WCS validation error: {e}")
+            return False
     
     def _solve_with_astrometry_net(self, image_data: np.ndarray, metadata: Dict) -> Optional[WCS]:
         """Solve using astrometry.net (requires astroquery and API key)."""
@@ -484,8 +752,53 @@ class PlateSolver:
         if wcs is None:
             raise ValueError("No WCS solution available")
         
-        world_coords = wcs.pixel_to_world(x, y)
-        return world_coords
+        # Validate WCS first
+        if not self._validate_wcs(wcs):
+            raise ValueError("WCS validation failed - cannot perform coordinate conversion")
+        
+        try:
+            # Use all_pix2world which is the most reliable method
+            # This uses 0-based indexing
+            world = wcs.all_pix2world([[x, y]], 0)
+            ra_deg = float(world[0][0])
+            dec_deg = float(world[0][1])
+            
+            # Validate converted coordinates
+            if not (0 <= ra_deg <= 360):
+                raise ValueError(f"Converted RA out of range: {ra_deg} degrees")
+            if not (-90 <= dec_deg <= 90):
+                raise ValueError(f"Converted Dec out of range: {dec_deg} degrees")
+            
+            # Create SkyCoord object
+            world_coord = SkyCoord(ra=ra_deg*u.deg, dec=dec_deg*u.deg, frame='icrs')
+            
+            if self.debug:
+                logger.debug(f"Converted pixel ({x:.2f}, {y:.2f}) to "
+                           f"RA={world_coord.ra.to_string(unit=u.hour, precision=2)}, "
+                           f"Dec={world_coord.dec.to_string(unit=u.deg, precision=2)}")
+            
+            return world_coord
+            
+        except ValueError as ve:
+            # Re-raise validation errors
+            logger.error(f"Coordinate conversion validation failed: {ve}")
+            raise
+            
+        except Exception as e:
+            logger.error(f"Failed to convert pixel to world coordinates: {e}")
+            
+            # If conversion fails, provide helpful diagnostic info
+            try:
+                logger.info("WCS diagnostic information:")
+                logger.info(f"  CTYPE: {wcs.wcs.ctype}")
+                logger.info(f"  CRPIX: {wcs.wcs.crpix}")
+                logger.info(f"  CRVAL: {wcs.wcs.crval}")
+                logger.info(f"  CDELT: {wcs.wcs.cdelt}")
+                logger.info(f"  Has celestial: {wcs.has_celestial}")
+            except:
+                pass
+            
+            raise ValueError(f"Could not convert pixel coordinates: {e}")
 
 
 class ObjectIdentifier:
@@ -494,62 +807,303 @@ class ObjectIdentifier:
     def __init__(self, debug: bool = False):
         self.debug = debug
     
+    def query_skybot(self, coord: SkyCoord, obs_time: Time, radius: float = 0.1, 
+                     fov_width: float = None, fov_height: float = None) -> List[Dict]:
+        """
+        Query SkyBoT (Sky Body Tracker) service for known solar system objects.
+        
+        SkyBoT is an excellent service from IMCCE that searches for all known
+        asteroids and comets in a given field of view at a specific time.
+        
+        Parameters:
+        -----------
+        coord : SkyCoord
+            Center coordinates of the field
+        obs_time : Time
+            Observation time
+        radius : float
+            Search radius in degrees (used if fov not specified)
+        fov_width : float, optional
+            Field of view width in degrees
+        fov_height : float, optional
+            Field of view height in degrees
+        
+        Returns:
+        --------
+        List[Dict] : List of found objects with their properties
+        """
+        try:
+            import requests
+            from astropy.table import Table
+            
+            # If FOV not specified, use circular field with radius
+            if fov_width is None:
+                fov_width = radius * 2
+            if fov_height is None:
+                fov_height = radius * 2
+            
+            # SkyBoT cone search endpoint
+            url = "http://vo.imcce.fr/webservices/skybot/skybotconesearch_query.php"
+            
+            # Prepare parameters
+            params = {
+                '-ra': coord.ra.deg,           # Right Ascension in degrees
+                '-dec': coord.dec.deg,         # Declination in degrees
+                '-rd': max(fov_width, fov_height) / 2,  # Search radius in degrees
+                '-ep': obs_time.jd,            # Epoch in Julian Date
+                '-loc': '500',                 # Observer location (500 = geocentric)
+                '-mime': 'text',               # Response format
+                '-output': 'basic'             # Output fields
+            }
+            
+            logger.info(f"Querying SkyBoT at RA={coord.ra.deg:.4f}, Dec={coord.dec.deg:.4f}, "
+                       f"JD={obs_time.jd:.2f}, radius={params['-rd']:.4f} deg")
+            
+            # Query SkyBoT
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            
+            # Parse response
+            objects = []
+            lines = response.text.strip().split('\n')
+            
+            # Skip header and comments
+            data_lines = [line for line in lines if not line.startswith('#') and line.strip()]
+            
+            if not data_lines:
+                logger.info("No objects found by SkyBoT")
+                return objects
+            
+            # Parse each object
+            for line in data_lines:
+                try:
+                    parts = line.split('|')
+                    if len(parts) < 10:
+                        continue
+                    
+                    # Extract object information
+                    # SkyBoT format: Num|Name|RA|Dec|Type|V|PosErr|CenterDist|AngDist|Mv|Err
+                    obj_number = parts[0].strip()
+                    obj_name = parts[1].strip()
+                    obj_ra = float(parts[2].strip())      # degrees
+                    obj_dec = float(parts[3].strip())     # degrees
+                    obj_type = parts[4].strip()           # Object type
+                    obj_mag = parts[5].strip()            # V magnitude
+                    pos_error = parts[6].strip()          # Position error in arcsec
+                    
+                    # Calculate separation from target coordinates
+                    obj_coord = SkyCoord(ra=obj_ra*u.deg, dec=obj_dec*u.deg)
+                    separation = coord.separation(obj_coord)
+                    
+                    # Determine object type
+                    if 'C' in obj_type or 'P' in obj_type:
+                        object_class = 'comet'
+                    else:
+                        object_class = 'asteroid'
+                    
+                    obj_info = {
+                        'name': obj_name,
+                        'number': obj_number,
+                        'designation': obj_name,
+                        'object_type': object_class,
+                        'database': 'SkyBoT',
+                        'ra': obj_ra,
+                        'dec': obj_dec,
+                        'separation': separation.arcsec,
+                        'separation_deg': separation.deg,
+                        'magnitude': obj_mag,
+                        'position_error': pos_error,
+                        'skybot_type': obj_type
+                    }
+                    
+                    objects.append(obj_info)
+                    
+                    if self.debug:
+                        logger.debug(f"Found {obj_name} ({object_class}) at "
+                                   f"separation {separation.arcsec:.1f} arcsec, mag {obj_mag}")
+                
+                except (ValueError, IndexError) as parse_error:
+                    logger.warning(f"Failed to parse SkyBoT line: {line[:50]}... Error: {parse_error}")
+                    continue
+            
+            logger.info(f"SkyBoT found {len(objects)} objects in field")
+            return objects
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"SkyBoT query failed (network error): {e}")
+            return []
+        except Exception as e:
+            logger.error(f"SkyBoT query failed: {e}")
+            if self.debug:
+                import traceback
+                logger.debug(traceback.format_exc())
+            return []
+    
     def query_minor_planet_center(self, coord: SkyCoord, radius: float = 0.1) -> List[Dict]:
         """Query Minor Planet Center for known objects."""
         try:
-            # Query MPC for objects near the coordinates
-            result = MPC.query_region(coord, radius=radius * u.deg)
-            
-            objects = []
-            if result is not None:
-                for row in result:
-                    obj = {
-                        'name': row.get('name', 'Unknown'),
-                        'designation': row.get('designation', ''),
-                        'object_type': 'asteroid',
-                        'database': 'MPC',
-                        'separation': 0.0  # Would calculate actual separation
-                    }
-                    objects.append(obj)
-            
-            return objects
+            # MPC.query_region is not available in newer versions
+            # Use SkyBoT instead as it's more comprehensive
+            logger.info("MPC direct query not available - use SkyBoT for comprehensive results")
+            return []
             
         except Exception as e:
             logger.error(f"MPC query failed: {e}")
             return []
     
     def query_jpl_horizons(self, coord: SkyCoord, obs_time: Time, radius: float = 0.1) -> List[Dict]:
-        """Query JPL Horizons for known objects."""
+        """Query JPL Horizons for specific known objects near coordinates."""
         try:
-            # This would require more complex implementation
-            # to search for objects near given coordinates
-            logger.warning("JPL Horizons coordinate search not fully implemented")
-            return []
+            from astroquery.jplhorizons import Horizons
+            
+            logger.info(f"Querying JPL Horizons for bright objects near coordinates")
+            
+            objects = []
+            
+            # Known bright asteroids and planets to check
+            # Major asteroids
+            bright_asteroids = [
+                ('1', 'Ceres'),
+                ('2', 'Pallas'), 
+                ('3', 'Juno'),
+                ('4', 'Vesta'),
+                ('10', 'Hygiea'),
+                ('15', 'Eunomia'),
+                ('16', 'Psyche'),
+                ('433', 'Eros'),
+                ('624', 'Hektor'),
+                ('704', 'Interamnia')
+            ]
+            
+            # Observer location (geocentric)
+            location = '500'  # Geocentric
+            
+            for obj_id, obj_name in bright_asteroids:
+                try:
+                    # Query ephemeris for this object
+                    obj = Horizons(id=obj_id, location=location, epochs=obs_time.jd)
+                    eph = obj.ephemerides()
+                    
+                    if len(eph) > 0:
+                        # Get RA/Dec from ephemeris
+                        obj_ra = eph['RA'][0]  # degrees
+                        obj_dec = eph['DEC'][0]  # degrees
+                        
+                        # Calculate separation
+                        obj_coord = SkyCoord(ra=obj_ra*u.deg, dec=obj_dec*u.deg)
+                        separation = coord.separation(obj_coord)
+                        
+                        # Check if within search radius
+                        if separation.deg < radius:
+                            obj_info = {
+                                'name': obj_name,
+                                'number': obj_id,
+                                'designation': f'({obj_id}) {obj_name}',
+                                'object_type': 'asteroid',
+                                'database': 'JPL Horizons',
+                                'separation': separation.arcsec,
+                                'separation_deg': separation.deg,
+                                'ra': obj_ra,
+                                'dec': obj_dec,
+                                'magnitude': eph['V'][0] if 'V' in eph.colnames else 'N/A'
+                            }
+                            objects.append(obj_info)
+                            logger.info(f"Found {obj_name} at separation {separation.arcsec:.1f} arcsec")
+                
+                except Exception as obj_error:
+                    # Object not found or error - continue
+                    if self.debug:
+                        logger.debug(f"Could not query {obj_name}: {obj_error}")
+                    continue
+            
+            return objects
             
         except Exception as e:
             logger.error(f"JPL Horizons query failed: {e}")
             return []
     
-    def identify_object(self, coord: SkyCoord, obs_time: Optional[Time] = None) -> Dict:
-        """Attempt to identify an object at given coordinates."""
+    def identify_object(self, coord: SkyCoord, obs_time: Optional[Time] = None, 
+                       fov_radius: float = 0.1) -> Dict:
+        """
+        Attempt to identify an object at given coordinates.
+        
+        Parameters:
+        -----------
+        coord : SkyCoord
+            Sky coordinates of detected object
+        obs_time : Time, optional
+            Observation time
+        fov_radius : float
+            Search radius in degrees (default: 0.1 deg = 6 arcmin)
+        
+        Returns:
+        --------
+        Dict : Identification results with known objects and best match
+        """
         identification = {
             'coordinates': coord,
             'known_objects': [],
             'is_known': False,
-            'best_match': None
+            'best_match': None,
+            'search_radius_deg': fov_radius,
+            'search_radius_arcmin': fov_radius * 60
         }
         
-        # Query databases
-        mpc_results = self.query_minor_planet_center(coord)
-        identification['known_objects'].extend(mpc_results)
-        
+        # Primary method: SkyBoT (most comprehensive)
         if obs_time:
-            horizons_results = self.query_jpl_horizons(coord, obs_time)
-            identification['known_objects'].extend(horizons_results)
+            logger.info(f"Searching for objects at RA={coord.ra.to_string(unit=u.hour, precision=2)}, "
+                       f"Dec={coord.dec.to_string(unit=u.deg, precision=2)}")
+            
+            try:
+                skybot_results = self.query_skybot(coord, obs_time, radius=fov_radius)
+                identification['known_objects'].extend(skybot_results)
+                
+                if skybot_results:
+                    logger.info(f"SkyBoT found {len(skybot_results)} objects")
+            except Exception as e:
+                logger.warning(f"SkyBoT query error: {e}")
+            
+            # Backup method: JPL Horizons for bright objects
+            try:
+                horizons_results = self.query_jpl_horizons(coord, obs_time, radius=fov_radius)
+                
+                # Add Horizons results that aren't already in SkyBoT results
+                skybot_names = {obj['name'] for obj in identification['known_objects']}
+                for h_obj in horizons_results:
+                    if h_obj['name'] not in skybot_names:
+                        identification['known_objects'].append(h_obj)
+            except Exception as e:
+                logger.warning(f"JPL Horizons query error: {e}")
+        else:
+            logger.warning("No observation time provided - cannot query object databases")
         
+        # Determine if object was identified
         if identification['known_objects']:
             identification['is_known'] = True
+            
+            # Sort by separation (closest first)
+            identification['known_objects'].sort(
+                key=lambda x: x.get('separation', float('inf'))
+            )
+            
             identification['best_match'] = identification['known_objects'][0]
+            
+            best = identification['best_match']
+            logger.info(f"✓ Object identified as: {best['designation']} "
+                       f"({best['object_type']}, separation: {best['separation']:.1f} arcsec)")
+            
+            # Log all matches if multiple found
+            if len(identification['known_objects']) > 1:
+                logger.info(f"  Additional {len(identification['known_objects'])-1} object(s) in field:")
+                for obj in identification['known_objects'][1:4]:  # Show up to 3 more
+                    logger.info(f"    - {obj['designation']} "
+                              f"({obj['object_type']}, {obj['separation']:.1f} arcsec)")
+        else:
+            logger.info("★ Object NOT found in databases - potential NEW DISCOVERY!")
+            logger.info(f"  Coordinates: RA={coord.ra.to_string(unit=u.hour, precision=2)}, "
+                       f"Dec={coord.dec.to_string(unit=u.deg, precision=2)}")
+            if obs_time:
+                logger.info(f"  Observation time: {obs_time.iso}")
         
         return identification
 
@@ -557,11 +1111,12 @@ class ObjectIdentifier:
 class AsteroidDetector:
     """Main class coordinating the detection pipeline."""
     
-    def __init__(self, debug: bool = False, progress: bool = True):
+    def __init__(self, debug: bool = False, progress: bool = True, max_dimension: int = 2048):
         self.debug = debug
         self.show_progress = progress
+        self.max_dimension = max_dimension
         
-        self.image_processor = ImageProcessor(debug)
+        self.image_processor = ImageProcessor(debug, max_dimension=max_dimension)
         self.star_detector = StarDetector(debug)
         self.motion_detector = MotionDetector(debug)
         self.plate_solver = PlateSolver(debug)
@@ -576,6 +1131,19 @@ class AsteroidDetector:
         
         logger.info(f"Processing {len(image_paths)} images")
         
+        # Check total memory requirements
+        total_size_mb = 0
+        for path in image_paths:
+            size_mb = path.stat().st_size / (1024 * 1024)
+            total_size_mb += size_mb
+        
+        logger.info(f"Total input data size: {total_size_mb:.1f} MB")
+        
+        if total_size_mb > 2000:  # More than 2GB of input
+            logger.warning("⚠️  Large dataset detected! This may consume significant memory.")
+            logger.warning("   Consider processing fewer images at once or using smaller files.")
+            logger.warning(f"   Estimated peak memory usage: ~{total_size_mb * 3:.0f} MB")
+        
         # Load and preprocess images
         image_data = []
         
@@ -589,7 +1157,10 @@ class AsteroidDetector:
                     # Detect stars
                     sources = self.star_detector.detect_stars(processed_data)
                     
+                    # Store only what we need, delete original data to free memory
                     image_data.append((processed_data, sources, metadata))
+                    del data  # Free original image memory
+                    
                     pbar.update(1)
                     
                 except Exception as e:
@@ -605,11 +1176,20 @@ class AsteroidDetector:
         logger.info("Registering images")
         registered_images = self.motion_detector.register_images(image_data)
         
+        # Free memory from original processed images
+        for i in range(len(image_data)):
+            image_data[i] = (None, image_data[i][1], image_data[i][2])  # Keep only sources and metadata
+        
         # Detect moving objects
         logger.info("Detecting moving objects")
         source_tables = [item[1] for item in image_data]
         moving_objects = self.motion_detector.detect_moving_objects(
             registered_images, source_tables)
+        
+        # Free registered images memory after detection
+        del registered_images
+        import gc
+        gc.collect()
         
         # Plate solve and identify objects
         results = []
@@ -618,8 +1198,8 @@ class AsteroidDetector:
         if moving_objects:
             logger.info(f"Analyzing {len(moving_objects)} potential objects")
             
-            # Get WCS solution from first image
-            wcs = self.plate_solver.solve_field(image_data[0][0], image_data[0][2])
+            # Get WCS solution from first image (we still have metadata)
+            wcs = self.plate_solver.solve_field(None, image_data[0][2])
             
             with tqdm(total=len(moving_objects), desc="Identifying objects",
                      disable=not self.show_progress) as pbar:
@@ -646,7 +1226,12 @@ class AsteroidDetector:
         result = {
             'pixel_coordinates': (obj['x'], obj['y']),
             'world_coordinates': None,
-            'identification': None,
+            'identification': {
+                'coordinates': None,
+                'known_objects': [],
+                'is_known': False,
+                'best_match': None
+            },
             'confidence': 'low',
             'metadata': obj
         }
@@ -664,12 +1249,15 @@ class AsteroidDetector:
                 
                 # Set confidence based on number of detections and identification
                 if obj.get('n_detections', 1) > 2:
-                    result['confidence'] = 'high' if identification['is_known'] else 'medium'
+                    result['confidence'] = 'high' if identification.get('is_known', False) else 'medium'
+                elif obj.get('n_detections', 1) > 1:
+                    result['confidence'] = 'medium' if identification.get('is_known', False) else 'low'
                 
             except Exception as e:
                 logger.error(f"Failed to analyze object: {e}")
                 if self.debug:
-                    raise
+                    import traceback
+                    logger.debug(traceback.format_exc())
         
         return result
     
@@ -693,12 +1281,24 @@ class AsteroidDetector:
             return {k: self._make_json_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._make_json_serializable(v) for v in obj]
-        elif hasattr(obj, 'to_string'):  # SkyCoord objects
+        elif isinstance(obj, SkyCoord):
+            # Convert SkyCoord to dict
+            return {
+                'ra_deg': float(obj.ra.deg),
+                'dec_deg': float(obj.dec.deg),
+                'ra_hms': obj.ra.to_string(unit=u.hour, precision=2),
+                'dec_dms': obj.dec.to_string(unit=u.deg, precision=2)
+            }
+        elif hasattr(obj, 'to_string'):  # Other astropy objects
             return str(obj)
+        elif isinstance(obj, Time):
+            return obj.iso
         elif isinstance(obj, (np.integer, np.floating)):
             return float(obj)
         elif isinstance(obj, np.ndarray):
             return obj.tolist()
+        elif isinstance(obj, u.Quantity):
+            return float(obj.value)
         else:
             return obj
     
@@ -722,29 +1322,101 @@ class AsteroidDetector:
             "## Detected Objects",
         ]
         
-        for i, obj in enumerate(self.results['objects'], 1):
+        if self.results['n_moving_objects_detected'] == 0:
             report_lines.extend([
-                f"### Object {i}",
-                f"- Pixel coordinates: ({obj['pixel_coordinates'][0]:.1f}, {obj['pixel_coordinates'][1]:.1f})",
-                f"- Confidence: {obj['confidence']}",
+                "",
+                "No moving objects detected in this image sequence.",
+                "",
+                "This could indicate:",
+                "- No asteroids/comets in the field of view during observation period",
+                "- Objects too faint for detection threshold",
+                "- Insufficient time separation between images",
+                "- Image quality issues affecting detection",
             ])
-            
-            if obj['world_coordinates']:
-                report_lines.append(f"- Sky coordinates: {obj['world_coordinates']}")
-            
-            if obj['identification']:
-                id_info = obj['identification']
-                if id_info['is_known']:
-                    best_match = id_info['best_match']
-                    report_lines.extend([
-                        f"- **IDENTIFIED**: {best_match['name']}",
-                        f"- Object type: {best_match['object_type']}",
-                        f"- Database: {best_match['database']}",
-                    ])
+        else:
+            for i, obj in enumerate(self.results['objects'], 1):
+                report_lines.extend([
+                    "",
+                    f"### Object {i}",
+                    f"- **Pixel coordinates**: ({obj['pixel_coordinates'][0]:.1f}, {obj['pixel_coordinates'][1]:.1f})",
+                    f"- **Confidence**: {obj['confidence']}",
+                    f"- **Detections**: {obj['metadata'].get('n_detections', 1)}",
+                ])
+                
+                # World coordinates
+                if obj['world_coordinates']:
+                    wc = obj['world_coordinates']
+                    if isinstance(wc, dict):
+                        report_lines.extend([
+                            f"- **RA**: {wc['ra_hms']}",
+                            f"- **Dec**: {wc['dec_dms']}",
+                            f"- **Coordinates**: RA={wc['ra_deg']:.6f}°, Dec={wc['dec_deg']:.6f}°",
+                        ])
+                    else:
+                        report_lines.append(f"- **Sky coordinates**: {wc}")
+                
+                # Identification
+                if obj['identification'] and obj['identification'].get('is_known'):
+                    best_match = obj['identification'].get('best_match')
+                    if best_match:
+                        report_lines.extend([
+                            "",
+                            f"#### Identification: {best_match['designation']}",
+                            f"- **Object type**: {best_match['object_type']}",
+                            f"- **Database**: {best_match['database']}",
+                            f"- **Separation**: {best_match.get('separation', 'N/A')} arcsec",
+                        ])
+                        
+                        if 'magnitude' in best_match and best_match['magnitude'] != 'N/A':
+                            report_lines.append(f"- **Magnitude**: {best_match['magnitude']}")
+                        
+                        # Additional objects in field
+                        other_objects = obj['identification'].get('known_objects', [])[1:4]
+                        if other_objects:
+                            report_lines.append("")
+                            report_lines.append("**Other objects in field:**")
+                            for other in other_objects:
+                                report_lines.append(
+                                    f"  - {other['designation']} "
+                                    f"({other['object_type']}, {other.get('separation', 'N/A')} arcsec)"
+                                )
                 else:
-                    report_lines.append("- **UNKNOWN OBJECT** - Potential new discovery!")
-            
-            report_lines.append("")
+                    report_lines.extend([
+                        "",
+                        "#### **POTENTIAL NEW DISCOVERY**",
+                        "- This object was not found in known object databases",
+                        "- Recommended next steps:",
+                        "  1. Verify detection in original images",
+                        "  2. Obtain follow-up observations",
+                        "  3. Check against latest MPC circulars",
+                        "  4. Consider reporting to Minor Planet Center",
+                    ])
+        
+        # Add footer
+        report_lines.extend([
+            "",
+            "---",
+            "",
+            "## Next Steps",
+            "",
+            "### For Identified Objects:",
+            "- Cross-reference with observation predictions",
+            "- Compare brightness with expected magnitude",
+            "- Document any unusual behavior",
+            "",
+            "### For Unknown Objects:",
+            "- Verify motion is consistent across all frames",
+            "- Check for artifacts or image defects",
+            "- Obtain additional observations for orbit determination",
+            "- Search recent discovery announcements",
+            "",
+            "### Data Quality:",
+            "- Review image alignment quality",
+            "- Check for tracking errors",
+            "- Verify detection threshold settings",
+            "",
+            f"*Report generated by Astronomical Object Detection System v1.0*"
+        ])
         
         with open(output_path, 'w') as f:
             f.write('\n'.join(report_lines))
@@ -762,6 +1434,7 @@ Examples:
   %(prog)s images/*.fits
   %(prog)s --debug --output results.json image1.jpg image2.jpg image3.jpg
   %(prog)s --no-progress --threshold 3.0 *.tiff
+  %(prog)s --max-images 5 *.xisf  # Limit to first 5 images to save memory
         """
     )
     
@@ -772,6 +1445,12 @@ Examples:
                        help='Output report file (default: detection_report.md)')
     parser.add_argument('--threshold', '-t', type=float, default=5.0,
                        help='Detection threshold (default: 5.0)')
+    parser.add_argument('--max-images', '-m', type=int, default=None,
+                       help='Maximum number of images to process (for memory management)')
+    parser.add_argument('--max-size', type=int, default=2048,
+                       help='Maximum image dimension in pixels (default: 2048, larger images will be downsampled)')
+    parser.add_argument('--no-downsample', action='store_true',
+                       help='Disable automatic downsampling (may use lots of memory)')
     parser.add_argument('--debug', '-d', action='store_true',
                        help='Enable debug output')
     parser.add_argument('--no-progress', action='store_true',
@@ -791,17 +1470,57 @@ Examples:
     image_paths = [Path(p) for p in args.images]
     
     # Validate input files
+    valid_paths = []
     for path in image_paths:
         if not path.exists():
             logger.error(f"File not found: {path}")
-            sys.exit(1)
+        else:
+            valid_paths.append(path)
+    
+    if not valid_paths:
+        logger.error("No valid input files found")
+        sys.exit(1)
+    
+    # Limit number of images if specified
+    if args.max_images and len(valid_paths) > args.max_images:
+        logger.warning(f"Limiting to first {args.max_images} images (out of {len(valid_paths)} total)")
+        logger.info("To process all images, remove --max-images flag or increase the limit")
+        valid_paths = valid_paths[:args.max_images]
+    
+    # Check if we have enough images
+    if len(valid_paths) < 2:
+        logger.error("Need at least 2 images for motion detection")
+        sys.exit(1)
+    
+    # Estimate memory usage
+    total_size_mb = sum(p.stat().st_size for p in valid_paths) / (1024 * 1024)
+    estimated_peak_mb = total_size_mb * 3  # Rough estimate
+    
+    # Adjust max dimension if downsampling is disabled
+    max_dimension = None if args.no_downsample else args.max_size
+    
+    if args.no_downsample and estimated_peak_mb > 2000:
+        logger.warning(f"⚠️  WARNING: --no-downsample specified with large files (~{estimated_peak_mb:.0f} MB)")
+        logger.warning("   This will likely cause out-of-memory errors")
+    elif not args.no_downsample:
+        logger.info(f"Images will be downsampled to max {args.max_size}x{args.max_size} pixels to save memory")
+        logger.info(f"(Use --no-downsample to disable, or --max-size to adjust)")
+    
+    if estimated_peak_mb > 8000 and args.no_downsample:  # More than 8GB
+        logger.error(f"❌ Cannot process: Estimated memory usage: ~{estimated_peak_mb:.0f} MB")
+        logger.error("   Use --max-size 2048 (or smaller) to enable downsampling")
+        sys.exit(1)
     
     try:
-        # Create detector
-        detector = AsteroidDetector(debug=args.debug, progress=not args.no_progress)
+        # Create detector with memory-saving settings
+        detector = AsteroidDetector(
+            debug=args.debug, 
+            progress=not args.no_progress,
+            max_dimension=max_dimension
+        )
         
         # Process images
-        results = detector.process_image_sequence(image_paths)
+        results = detector.process_image_sequence(valid_paths)
         
         # Save results
         detector.save_results(args.output)
@@ -820,6 +1539,15 @@ Examples:
         print(f"\nResults saved to: {args.output}")
         print(f"Report saved to: {args.report}")
         
+    except MemoryError:
+        logger.error("❌ Out of memory error!")
+        logger.error("Your images are too large to process all at once.")
+        logger.error("Try one of these solutions:")
+        logger.error("  1. Process fewer images: python asteroid_detector.py --max-images 3 *.xisf")
+        logger.error("  2. Bin your images 2x2 in PixInsight before detection")
+        logger.error("  3. Convert to smaller FITS files")
+        logger.error("  4. Run on a machine with more RAM")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Detection failed: {e}")
         if args.debug:
